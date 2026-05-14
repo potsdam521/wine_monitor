@@ -1,0 +1,13 @@
+# Data files generated at runtime
+*.json
+*.log
+*.txt
+wine_dashboard.html
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
