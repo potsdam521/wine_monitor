@@ -912,6 +912,24 @@ def generate_dashboard(today: str, costco_snapshot: dict, costco_changes: dict |
     drops_list.sort(key=lambda w: -w["pct"])
     increases_list.sort(key=lambda w: -w["pct"])
 
+    # All-time new wines: first entry in history = first seen date
+    _snap_idx: dict[str, tuple[str, float | None]] = {}
+    for _cat, _prods in costco_snapshot.items():
+        for _p in _prods:
+            if isinstance(_p, dict) and _p.get("name"):
+                _snap_idx[_p["name"]] = (_p.get("url", ""), _p.get("price"))
+    all_new_wines: list[dict] = []
+    for _cat, _wines in costco_history.items():
+        for _wname, _entries in _wines.items():
+            if _entries:
+                _url, _price = _snap_idx.get(_wname, ("", None))
+                all_new_wines.append({
+                    "name": _wname, "cat": _cat,
+                    "first_seen": _entries[0]["date"],
+                    "price": _price, "url": _url,
+                })
+    all_new_wines.sort(key=lambda w: w["first_seen"], reverse=True)
+
     dashboard_data = {
         "date": today,
         "is_baseline": costco_changes is None,
@@ -923,6 +941,7 @@ def generate_dashboard(today: str, costco_snapshot: dict, costco_changes: dict |
             "new_wines_list": new_wines_list,
             "drops_list":     drops_list,
             "increases_list": increases_list,
+            "all_new_wines":  all_new_wines,
         },
         "regions": regions,
         "watchlist": wl_charts,
@@ -1273,7 +1292,7 @@ setTimeout(() => {{
 // ── Modal ────────────────────────────────────────────────────────────────────
 let modalWines = [], modalFilter = 'all', modalMode = 'new';
 
-function openModal(title, subtitle, wines, mode) {{
+function openModal(title, subtitle, wines, mode, keepPeriodBar) {{
   modalWines  = wines;
   modalFilter = 'all';
   modalMode   = mode;
@@ -1283,7 +1302,9 @@ function openModal(title, subtitle, wines, mode) {{
   // Build category pills
   const cats = [...new Set(wines.map(w => w.cat))].filter(Boolean);
   const ctrl = document.getElementById('modal-controls');
+  const savedPbar = keepPeriodBar ? document.getElementById('modal-period-bar') : null;
   ctrl.innerHTML = '';
+  if (savedPbar) ctrl.prepend(savedPbar);
   const mkPill = (label, val) => {{
     const b = document.createElement('button');
     b.className = 'modal-pill' + (val === 'all' ? ' active' : '');
@@ -1371,9 +1392,74 @@ document.addEventListener('keydown', e => {{
 
 // ── Gauge clicks ─────────────────────────────────────────────────────────────
 document.getElementById('gc-new').addEventListener('click', () => {{
-  if (!C.new_wines_list.length) return;
-  openModal('🍷 Nuevos Vinos', `${{C.new_total}} vino(s) nuevo(s) detectado(s) esta corrida`,
-    C.new_wines_list, 'new');
+  const allNew = C.all_new_wines || [];
+  if (!C.new_wines_list.length && !allNew.length) return;
+  const todayStr = D.date;
+
+  function daysMinus(n) {{
+    const d = new Date(todayStr); d.setDate(d.getDate() - n);
+    return d.toISOString().slice(0, 10);
+  }}
+
+  function winesForPeriod(period, dateVal) {{
+    if (period === 'run') return C.new_wines_list;
+    if (period === 'date') return allNew.filter(w => w.first_seen === (dateVal || todayStr));
+    const cutoff = period === '7d' ? daysMinus(7) : daysMinus(30);
+    return allNew.filter(w => w.first_seen >= cutoff);
+  }}
+
+  function openPeriod(period, activePillEl, dateVal) {{
+    const wines = winesForPeriod(period, dateVal);
+    const subs = {{
+      run:   `${{C.new_total}} vino(s) nuevo(s) esta corrida`,
+      '7d':  `Últimos 7 días — ${{wines.length}} vino(s)`,
+      '30d': `Últimos 30 días — ${{wines.length}} vino(s)`,
+      date:  `${{dateVal || todayStr}} — ${{wines.length}} vino(s)`,
+    }};
+    openModal('🍷 Nuevos Vinos', subs[period] || '', wines, 'new', true);
+    document.getElementById('modal-period-bar').querySelectorAll('.period-btn')
+      .forEach(b => b.classList.toggle('active', b === activePillEl));
+    const di = document.getElementById('modal-date-input');
+    if (di) di.style.display = period === 'date' ? 'inline-block' : 'none';
+  }}
+
+  // Initial open with "this run"
+  openModal('🍷 Nuevos Vinos', `${{C.new_total}} vino(s) nuevo(s) esta corrida`,
+    C.new_wines_list, 'new', false);
+
+  // Inject period bar at top of modal-controls
+  const ctrl = document.getElementById('modal-controls');
+  const pbar = document.createElement('div');
+  pbar.id = 'modal-period-bar';
+  pbar.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap;align-items:center;width:100%;padding-bottom:8px;margin-bottom:4px;border-bottom:1px solid var(--border);';
+
+  const pillMap = {{}};
+  [['Esta corrida','run'],['7 días','7d'],['30 días','30d'],['Por fecha','date']].forEach(([lbl, val]) => {{
+    const btn = document.createElement('button');
+    btn.className = 'modal-pill period-btn' + (val === 'run' ? ' active' : '');
+    btn.textContent = lbl;
+    pillMap[val] = btn;
+    btn.addEventListener('click', () => {{
+      const di = document.getElementById('modal-date-input');
+      if (val === 'date') {{
+        if (di) di.style.display = 'inline-block';
+        openPeriod('date', btn, di ? di.value : todayStr);
+      }} else {{
+        if (di) di.style.display = 'none';
+        openPeriod(val, btn, null);
+      }}
+    }});
+    pbar.appendChild(btn);
+  }});
+
+  const dateInput = document.createElement('input');
+  dateInput.id = 'modal-date-input';
+  dateInput.type = 'date';
+  dateInput.value = todayStr;
+  dateInput.style.cssText = 'display:none;padding:4px 8px;background:#0d0608;border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.78rem;outline:none;margin-left:4px;';
+  dateInput.addEventListener('change', () => openPeriod('date', pillMap['date'], dateInput.value));
+  pbar.appendChild(dateInput);
+  ctrl.prepend(pbar);
 }});
 document.getElementById('gc-drops').addEventListener('click', () => {{
   if (!C.drops_list.length) return;
