@@ -2,6 +2,7 @@
 *.json
 *.log
 *.txt
+!requirements.txt
 wine_dashboard.html
 
 # Python
