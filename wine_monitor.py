@@ -723,7 +723,14 @@ def selenium_fetch_price(url: str, pickup_location: str | None = None) -> float 
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--window-size=1920,1080")
     opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_argument("--disable-background-networking")   # suppresses GCM/push errors
+    opts.add_argument("--disable-background-timer-throttling")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--disable-default-apps")
+    opts.add_argument("--disable-logging")
+    opts.add_argument("--log-level=3")                     # FATAL only
+    opts.add_argument("--silent")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
     opts.add_experimental_option("useAutomationExtension", False)
     opts.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -732,19 +739,27 @@ def selenium_fetch_price(url: str, pickup_location: str | None = None) -> float 
 
     driver = None
     try:
-        driver = webdriver.Chrome(
-            service=Service(ChromeDriverManager().install()), options=opts
+        service = Service(
+            ChromeDriverManager().install(),
+            log_path="NUL",                                # suppress chromedriver console output
         )
+        driver = webdriver.Chrome(service=service, options=opts)
+        driver.set_page_load_timeout(30)          # hard cap: never hang on page load
+        driver.set_script_timeout(15)
         driver.execute_cdp_cmd(
             "Page.addScriptToEvaluateOnNewDocument",
             {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"},
         )
-        driver.get(url)
-        wait = WebDriverWait(driver, 20)
+        try:
+            driver.get(url)
+        except Exception as exc:
+            log.warning("  selenium page load timeout/error: %s", exc)
+            # Continue — partial page may still have price data
 
         # ── Set pickup location (Soriana / VTEX) ────────────────────────────
         if pickup_location:
-            # Common VTEX store-picker button selectors
+            # Wait briefly for the store-picker button to appear
+            short_wait = WebDriverWait(driver, 5)
             picker_sels = [
                 "[class*='store-selector'] button",
                 "[class*='pickup'] button",
@@ -756,10 +771,9 @@ def selenium_fetch_price(url: str, pickup_location: str | None = None) -> float 
             ]
             for sel in picker_sels:
                 try:
-                    btn = driver.find_element(By.CSS_SELECTOR, sel)
+                    btn = short_wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, sel)))
                     driver.execute_script("arguments[0].click();", btn)
                     time.sleep(1.5)
-                    # Search input inside the picker modal
                     inp_sels = [
                         "input[placeholder*='código postal']",
                         "input[placeholder*='Código Postal']",
@@ -769,22 +783,20 @@ def selenium_fetch_price(url: str, pickup_location: str | None = None) -> float 
                         "input[type='search']",
                         "[class*='modal'] input[type='text']",
                     ]
-                    for isел in inp_sels:
+                    for isel in inp_sels:
                         try:
-                            inp = driver.find_element(By.CSS_SELECTOR, isел)
+                            inp = driver.find_element(By.CSS_SELECTOR, isel)
                             inp.clear()
                             inp.send_keys(pickup_location)
                             time.sleep(2)
-                            # Click first matching result
-                            result_sels = [
+                            for rsel in [
                                 "[class*='result']:first-child",
                                 "li[class*='item']:first-child",
                                 "[class*='store-list'] li:first-child",
                                 "[class*='option']:first-child",
-                            ]
-                            for rsел in result_sels:
+                            ]:
                                 try:
-                                    res = driver.find_element(By.CSS_SELECTOR, rsел)
+                                    res = driver.find_element(By.CSS_SELECTOR, rsel)
                                     driver.execute_script("arguments[0].click();", res)
                                     time.sleep(2)
                                     break
@@ -797,8 +809,8 @@ def selenium_fetch_price(url: str, pickup_location: str | None = None) -> float 
                 except Exception:
                     continue
 
-        # ── Wait for price ───────────────────────────────────────────────────
-        # VTEX / Soriana price selectors (most specific first)
+        # ── Extract price — one single wait, then fast find_elements scan ────
+        # Wait up to 10 s for ANY price-like element to appear, then read all candidates
         price_sels = [
             ".vtex-product-price-1-x-sellingPriceValue",
             ".vtex-product-price-1-x-sellingPrice",
@@ -811,15 +823,22 @@ def selenium_fetch_price(url: str, pickup_location: str | None = None) -> float 
             ".price",
             ".product-price",
         ]
+        combined = ", ".join(price_sels)
+        try:
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, combined))
+            )
+        except Exception:
+            pass  # page may still have partial data — try anyway
+
         for sel in price_sels:
-            try:
-                el = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, sel)))
-                val = parse_price(el.text.strip() or el.get_attribute("content") or "")
+            for el in driver.find_elements(By.CSS_SELECTOR, sel):
+                val = parse_price(
+                    el.text.strip() or el.get_attribute("content") or ""
+                )
                 if val:
                     log.debug("  selenium price via '%s': %s", sel, val)
                     return val
-            except Exception:
-                continue
 
         # Last resort: parse rendered HTML with BeautifulSoup
         soup = BeautifulSoup(driver.page_source, "html.parser")
