@@ -51,6 +51,22 @@ WATCHLIST = [
         "currency": "MXN",
         "notes"   : "",
     },
+    {
+        "name"           : "Faustino I Gran Reserva 1995 Tempranillo 750ml",
+        "url"            : "https://www.soriana.com/vino-tinto-faustino-i-gran-reserva-1995-tempranillo-750-ml/11714238.html",
+        "site"           : "Soriana.com",
+        "currency"       : "MXN",
+        "notes"          : "",
+        "pickup_location": "Pilares",
+    },
+    {
+        "name"           : "Faustino I Gran Reserva 1964 Tempranillo 750ml",
+        "url"            : "https://www.soriana.com/vino-tinto-faustino-i-gran-reserva-1964-tempranillo-750-ml/11714226.html",
+        "site"           : "Soriana.com",
+        "currency"       : "MXN",
+        "notes"          : "",
+        "pickup_location": "Pilares",
+    },
 ]
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -683,6 +699,143 @@ def watchlist_extract_price(soup: BeautifulSoup, hint: str | None = None) -> flo
     return None
 
 
+def selenium_fetch_price(url: str, pickup_location: str | None = None) -> float | None:
+    """
+    Fetch price from a JS-heavy site using headless Chrome.
+    If pickup_location is given (e.g. 'Pilares'), attempts to set it before reading the price.
+    Requires: pip install selenium webdriver-manager
+    """
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.chrome.service import Service
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        from webdriver_manager.chrome import ChromeDriverManager
+    except ImportError:
+        log.error("Selenium not installed. Run: pip install selenium webdriver-manager")
+        return None
+
+    opts = Options()
+    opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    opts.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+
+    driver = None
+    try:
+        driver = webdriver.Chrome(
+            service=Service(ChromeDriverManager().install()), options=opts
+        )
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"},
+        )
+        driver.get(url)
+        wait = WebDriverWait(driver, 20)
+
+        # ── Set pickup location (Soriana / VTEX) ────────────────────────────
+        if pickup_location:
+            # Common VTEX store-picker button selectors
+            picker_sels = [
+                "[class*='store-selector'] button",
+                "[class*='pickup'] button",
+                "button[class*='location']",
+                "[class*='addressBar'] button",
+                "[data-testid*='location']",
+                "span[class*='address']",
+                ".vtex-store-header button",
+            ]
+            for sel in picker_sels:
+                try:
+                    btn = driver.find_element(By.CSS_SELECTOR, sel)
+                    driver.execute_script("arguments[0].click();", btn)
+                    time.sleep(1.5)
+                    # Search input inside the picker modal
+                    inp_sels = [
+                        "input[placeholder*='código postal']",
+                        "input[placeholder*='Código Postal']",
+                        "input[placeholder*='buscar']",
+                        "input[placeholder*='Buscar']",
+                        "input[placeholder*='ubicación']",
+                        "input[type='search']",
+                        "[class*='modal'] input[type='text']",
+                    ]
+                    for isел in inp_sels:
+                        try:
+                            inp = driver.find_element(By.CSS_SELECTOR, isел)
+                            inp.clear()
+                            inp.send_keys(pickup_location)
+                            time.sleep(2)
+                            # Click first matching result
+                            result_sels = [
+                                "[class*='result']:first-child",
+                                "li[class*='item']:first-child",
+                                "[class*='store-list'] li:first-child",
+                                "[class*='option']:first-child",
+                            ]
+                            for rsел in result_sels:
+                                try:
+                                    res = driver.find_element(By.CSS_SELECTOR, rsел)
+                                    driver.execute_script("arguments[0].click();", res)
+                                    time.sleep(2)
+                                    break
+                                except Exception:
+                                    continue
+                            break
+                        except Exception:
+                            continue
+                    break
+                except Exception:
+                    continue
+
+        # ── Wait for price ───────────────────────────────────────────────────
+        # VTEX / Soriana price selectors (most specific first)
+        price_sels = [
+            ".vtex-product-price-1-x-sellingPriceValue",
+            ".vtex-product-price-1-x-sellingPrice",
+            "[class*='sellingPriceValue']",
+            "[class*='sellingPrice']",
+            "[class*='bestPrice']",
+            "[class*='price-best']",
+            "[class*='ProductPrice']",
+            "[data-testid='price']",
+            ".price",
+            ".product-price",
+        ]
+        for sel in price_sels:
+            try:
+                el = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, sel)))
+                val = parse_price(el.text.strip() or el.get_attribute("content") or "")
+                if val:
+                    log.debug("  selenium price via '%s': %s", sel, val)
+                    return val
+            except Exception:
+                continue
+
+        # Last resort: parse rendered HTML with BeautifulSoup
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        return watchlist_extract_price(soup)
+
+    except Exception as exc:
+        log.warning("  selenium_fetch_price error: %s", exc)
+        return None
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+
 def watchlist_fetch_all() -> list[dict]:
     log.info("── Watchlist: %d producto(s) …", len(WATCHLIST))
     session = requests.Session()
@@ -691,15 +844,24 @@ def watchlist_fetch_all() -> list[dict]:
     for i, product in enumerate(WATCHLIST):
         r = {"name": product["name"], "url": product["url"], "site": product["site"],
              "currency": product.get("currency", "MXN"), "price": None, "error": None}
+        pickup = product.get("pickup_location")
         try:
-            resp = session.get(product["url"], timeout=30)
-            resp.raise_for_status()
-            price = watchlist_extract_price(BeautifulSoup(resp.text, "html.parser"),
-                                            product.get("price_selector"))
+            if pickup or product.get("requires_browser"):
+                # JS-heavy site — use headless Chrome
+                log.info("  %-50s  [browser] pickup=%s", product["name"][:50], pickup or "—")
+                price = selenium_fetch_price(product["url"], pickup)
+            else:
+                resp = session.get(product["url"], timeout=30)
+                resp.raise_for_status()
+                price = watchlist_extract_price(BeautifulSoup(resp.text, "html.parser"),
+                                                product.get("price_selector"))
             r["price"] = price
             log.info("  %-50s  %s", product["name"][:50],
                      fmt_price(price, r["currency"]) if price else "⚠️  sin precio")
         except requests.RequestException as exc:
+            r["error"] = str(exc)
+            log.warning("  %-50s  ERROR: %s", product["name"][:50], exc)
+        except Exception as exc:
             r["error"] = str(exc)
             log.warning("  %-50s  ERROR: %s", product["name"][:50], exc)
         results.append(r)
