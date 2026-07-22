@@ -317,8 +317,13 @@ COSTCO_HISTORY_FILE     = BASE_DIR / "wine_price_history.json"
 COSTCO_FINDINGS_FILE    = BASE_DIR / "costco_wine_findings.txt"
 WATCHLIST_HISTORY_FILE  = BASE_DIR / "watchlist_price_history.json"
 WATCHLIST_FINDINGS_FILE = BASE_DIR / "watchlist_findings.txt"
+TLWM_LATEST_FILE        = BASE_DIR / "tlwm_list_latest.json"
+TLWM_HISTORY_FILE       = BASE_DIR / "tlwm_price_history.json"
+TLWM_FINDINGS_FILE      = BASE_DIR / "tlwm_findings.txt"
 DASHBOARD_FILE          = BASE_DIR / "wine_dashboard.html"
 LOG_FILE                = BASE_DIR / "wine_monitor.log"
+
+TLWM_BASE_URL = "https://www.thelittlewinemarket.com"
 
 PAGE_SLEEP     = 1.5
 CATEGORY_SLEEP = 2.0
@@ -855,18 +860,27 @@ def selenium_fetch_price(url: str, pickup_location: str | None = None) -> float 
                 pass
 
 
-def watchlist_fetch_all() -> list[dict]:
-    log.info("── Watchlist: %d producto(s) …", len(WATCHLIST))
+def _needs_browser(product: dict) -> bool:
+    return bool(product.get("pickup_location") or product.get("requires_browser"))
+
+
+def watchlist_fetch_group(browser: bool) -> list[dict]:
+    """Fetch the fast (requests) or slow (browser) subset of WATCHLIST."""
+    group = [p for p in WATCHLIST if _needs_browser(p) == browser]
+    if not group:
+        return []
+    label = "browser" if browser else "fast"
+    log.info("── Watchlist [%s]: %d producto(s) …", label, len(group))
     session = requests.Session()
     session.headers.update(HEADERS)
     results = []
-    for i, product in enumerate(WATCHLIST):
+    for i, product in enumerate(group):
         r = {"name": product["name"], "url": product["url"], "site": product["site"],
-             "currency": product.get("currency", "MXN"), "price": None, "error": None}
+             "currency": product.get("currency", "MXN"), "price": None, "error": None,
+             "pending": False}
         pickup = product.get("pickup_location")
         try:
-            if pickup or product.get("requires_browser"):
-                # JS-heavy site — use headless Chrome
+            if browser:
                 log.info("  %-50s  [browser] pickup=%s", product["name"][:50], pickup or "—")
                 price = selenium_fetch_price(product["url"], pickup)
             else:
@@ -884,9 +898,23 @@ def watchlist_fetch_all() -> list[dict]:
             r["error"] = str(exc)
             log.warning("  %-50s  ERROR: %s", product["name"][:50], exc)
         results.append(r)
-        if i < len(WATCHLIST) - 1:
+        if i < len(group) - 1:
             time.sleep(PRODUCT_SLEEP)
     return results
+
+
+def watchlist_pending_placeholders() -> list[dict]:
+    """Return placeholder rows for browser-based items (shown while Selenium runs)."""
+    return [
+        {"name": p["name"], "url": p["url"], "site": p["site"],
+         "currency": p.get("currency", "MXN"), "price": None, "error": None, "pending": True}
+        for p in WATCHLIST if _needs_browser(p)
+    ]
+
+
+def watchlist_fetch_all() -> list[dict]:
+    """Legacy helper — fetches all items sequentially (fast then browser)."""
+    return watchlist_fetch_group(browser=False) + watchlist_fetch_group(browser=True)
 
 
 def watchlist_update_history(history: dict, results: list[dict], today: str) -> dict:
@@ -956,6 +984,123 @@ def watchlist_build_report(results: list[dict], history: dict, today: str) -> st
             lines.append(f"    • {d['name']}  —  {d['error']}")
     lines += ["", DIVIDER, ""]
     return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  THE LITTLE WINE MARKET  (Shopify JSON API — no HTML scraping needed)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def tlwm_scrape_all() -> list[dict]:
+    log.info("── TLWM: fetching thelittlewinemarket.com …")
+    products: list[dict] = []
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    page = 1
+    while True:
+        url = f"{TLWM_BASE_URL}/collections/all/products.json?limit=250&page={page}"
+        try:
+            resp = session.get(url, timeout=30)
+            resp.raise_for_status()
+            batch = resp.json().get("products", [])
+        except Exception as exc:
+            log.warning("  TLWM fetch error (page %d): %s", page, exc)
+            break
+        if not batch:
+            break
+        for p in batch:
+            variant     = (p.get("variants") or [{}])[0]
+            price       = parse_price(str(variant.get("price") or ""))
+            compare_at  = parse_price(str(variant.get("compare_at_price") or ""))
+            available   = variant.get("available", True)
+            products.append({
+                "name":             p.get("title", ""),
+                "vendor":           p.get("vendor", ""),
+                "product_type":     p.get("product_type", ""),
+                "price":            price,
+                "compare_at_price": compare_at,
+                "url":              f"{TLWM_BASE_URL}/products/{p.get('handle','')}",
+                "available":        available,
+                "tags":             p.get("tags", []),
+            })
+        if len(batch) < 250:
+            break
+        page += 1
+        time.sleep(1.0)
+    log.info("  TLWM: %d productos (%d con precio, %d agotados)",
+             len(products),
+             sum(1 for p in products if p["price"]),
+             sum(1 for p in products if not p["available"]))
+    return products
+
+
+def tlwm_update_history(history: dict, products: list[dict], today: str) -> dict:
+    for p in products:
+        if p["price"] is None:
+            continue
+        entries = history.setdefault(p["name"], [])
+        if not entries or entries[-1]["price"] != p["price"]:
+            entries.append({"date": today, "price": p["price"]})
+    return history
+
+
+def tlwm_compare(prev: list[dict], curr: list[dict]) -> dict:
+    prev_map = {p["name"]: p for p in prev}
+    curr_map = {p["name"]: p for p in curr}
+    new_wines  = [p for n, p in curr_map.items() if n not in prev_map]
+    removed    = [p for n, p in prev_map.items() if n not in curr_map]
+    drops: list[dict] = []
+    increases: list[dict] = []
+    for name, cp in curr_map.items():
+        pp = prev_map.get(name)
+        if pp is None or pp.get("price") is None or cp.get("price") is None:
+            continue
+        op, np_ = pp["price"], cp["price"]
+        if np_ < op:
+            pct = (op - np_) / op * 100
+            drops.append({**cp, "old": op, "new": np_, "pct": round(pct,1), "saving": op - np_})
+        elif np_ > op:
+            pct = (np_ - op) / op * 100
+            increases.append({**cp, "old": op, "new": np_, "pct": round(pct,1), "extra": np_ - op})
+    drops.sort(key=lambda x: x["pct"], reverse=True)
+    increases.sort(key=lambda x: x["pct"], reverse=True)
+    return {"new_wines": new_wines, "removed": removed, "drops": drops, "increases": increases}
+
+
+def run_tlwm(today: str):
+    prev = load_json(TLWM_LATEST_FILE) or None
+    history = load_json(TLWM_HISTORY_FILE)
+    curr = tlwm_scrape_all()
+    history = tlwm_update_history(history, curr, today)
+    save_json(TLWM_HISTORY_FILE, history)
+    if not prev:
+        save_json(TLWM_LATEST_FILE, curr)
+        log.info("TLWM baseline guardado — %d productos", len(curr))
+        return curr, None, history
+    changes = tlwm_compare(prev, curr)
+    n_new = len(changes["new_wines"])
+    n_d   = len(changes["drops"])
+    n_i   = len(changes["increases"])
+    n_r   = len(changes["removed"])
+    lines = [DIVIDER, f"  THE LITTLE WINE MARKET — {today}", DIVIDER, ""]
+    lines += [f"  🍷 NUEVOS ({n_new})", f"  {THIN}"]
+    lines += ["  (ninguno)"] if not n_new else \
+             [f"    • {w['name']}  {fmt_price(w.get('price'))}" for w in changes["new_wines"]]
+    lines += ["", f"  📉 DESCUENTOS ({n_d})", f"  {THIN}"]
+    lines += ["  (ninguno)"] if not n_d else \
+             [f"    ▼ {d['name']}  {fmt_price(d['old'])} → {fmt_price(d['new'])}  (-{d['pct']:.1f}%)"
+              for d in changes["drops"]]
+    lines += ["", f"  📈 ALZAS ({n_i})", f"  {THIN}"]
+    lines += ["  (ninguno)"] if not n_i else \
+             [f"    ▲ {d['name']}  {fmt_price(d['old'])} → {fmt_price(d['new'])}  (+{d['pct']:.1f}%)"
+              for d in changes["increases"]]
+    if n_r:
+        lines += ["", f"  ❌ RETIRADOS ({n_r})", f"  {THIN}"]
+        lines += [f"    • {w['name']}" for w in changes["removed"]]
+    lines += ["", DIVIDER, ""]
+    prepend_to_file(TLWM_FINDINGS_FILE, "\n".join(lines))
+    save_json(TLWM_LATEST_FILE, curr)
+    log.info("TLWM → Nuevos: %d  Descuentos: %d  Alzas: %d  Retirados: %d", n_new, n_d, n_i, n_r)
+    return curr, changes, history
 
 
 def run_watchlist(today: str):
@@ -1029,7 +1174,8 @@ def aggregate_regions(snapshot: dict, new_wines_dict: dict) -> list[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def generate_dashboard(today: str, costco_snapshot: dict, costco_changes: dict | None,
-                       costco_history: dict, watchlist_results: list[dict],
+                       costco_history: dict, tlwm_snapshot: list, tlwm_changes: dict | None,
+                       tlwm_history: dict, watchlist_results: list[dict],
                        watchlist_history: dict) -> None:
 
     new_wines_dict = costco_changes.get("new_wines", {}) if costco_changes else {}
@@ -1055,13 +1201,29 @@ def generate_dashboard(today: str, costco_snapshot: dict, costco_changes: dict |
             if len(drop_sparklines) >= 5:
                 break
 
+    # TLWM data for dashboard
+    tlwm_total     = len(tlwm_snapshot)
+    tlwm_new_total = len(tlwm_changes["new_wines"])  if tlwm_changes else 0
+    tlwm_n_drops   = len(tlwm_changes["drops"])      if tlwm_changes else 0
+    tlwm_n_inc     = len(tlwm_changes["increases"])  if tlwm_changes else 0
+    tlwm_new_list  = [{"name": w["name"], "price": w.get("price"), "url": w.get("url",""),
+                        "vendor": w.get("vendor",""), "type": w.get("product_type","")}
+                       for w in (tlwm_changes["new_wines"] if tlwm_changes else [])]
+    tlwm_drops_list = [{"name": d["name"], "old": d["old"], "new": d["new"],
+                         "pct": d["pct"], "saving": d["saving"], "url": d.get("url","")}
+                        for d in (tlwm_changes["drops"] if tlwm_changes else [])]
+    tlwm_inc_list   = [{"name": d["name"], "old": d["old"], "new": d["new"],
+                         "pct": d["pct"], "extra": d["extra"], "url": d.get("url","")}
+                        for d in (tlwm_changes["increases"] if tlwm_changes else [])]
+
     # Watchlist price histories
     wl_charts: list[dict] = []
     for r in watchlist_results:
         hist = watchlist_history.get(r["url"], [])
         wl_charts.append({"name": r["name"], "site": r["site"],
                            "currency": r.get("currency", "MXN"),
-                           "price": r["price"], "history": hist})
+                           "price": r["price"], "history": hist,
+                           "pending": r.get("pending", False)})
 
     # Full wine lists for gauge modals
     new_wines_list: list[dict] = []
@@ -1125,6 +1287,14 @@ def generate_dashboard(today: str, costco_snapshot: dict, costco_changes: dict |
             "all_new_wines":  all_new_wines,
         },
         "regions": regions,
+        "tlwm": {
+            "total": tlwm_total, "new_total": tlwm_new_total,
+            "n_drops": tlwm_n_drops, "n_increases": tlwm_n_inc,
+            "is_baseline": tlwm_changes is None,
+            "new_wines_list": tlwm_new_list,
+            "drops_list":     tlwm_drops_list,
+            "increases_list": tlwm_inc_list,
+        },
         "watchlist": wl_charts,
     }
 
@@ -1413,6 +1583,50 @@ def generate_dashboard(today: str, costco_snapshot: dict, costco_changes: dict |
     </div>
   </div>
   <div id="wine-map"></div>
+</div>
+
+<!-- Watchlist -->
+<!-- The Little Wine Market -->
+<p class="section-title">The Little Wine Market — Resumen</p>
+<div id="tlwm-baseline-notice" style="display:none" class="baseline-notice">
+  📋 Primera corrida TLWM — datos de referencia guardados.
+</div>
+<div class="gauges" id="tlwm-gauges">
+  <div class="gauge-card g-total">
+    <svg class="gauge-svg" viewBox="0 0 200 95">
+      <path class="gauge-bg"   d="M 20 85 A 80 80 0 0 1 180 85"/>
+      <path class="gauge-fill" d="M 20 85 A 80 80 0 0 1 180 85" id="gf-tlwm-total" stroke="#d4a843"/>
+      <text class="gauge-num"  x="100" y="75" text-anchor="middle" id="gv-tlwm-total">0</text>
+    </svg>
+    <div class="gauge-label">TLWM TOTAL</div>
+  </div>
+  <div class="gauge-card g-new clickable" id="tlwm-gc-new" title="Clic para ver nuevos">
+    <svg class="gauge-svg" viewBox="0 0 200 95">
+      <path class="gauge-bg"   d="M 20 85 A 80 80 0 0 1 180 85"/>
+      <path class="gauge-fill" d="M 20 85 A 80 80 0 0 1 180 85" id="gf-tlwm-new" stroke="#2980b9"/>
+      <text class="gauge-num"  x="100" y="75" text-anchor="middle" id="gv-tlwm-new">0</text>
+    </svg>
+    <div class="gauge-label">NUEVOS TLWM</div>
+    <div class="gauge-hint">↗ VER LISTA</div>
+  </div>
+  <div class="gauge-card g-drops clickable" id="tlwm-gc-drops" title="Clic para ver descuentos">
+    <svg class="gauge-svg" viewBox="0 0 200 95">
+      <path class="gauge-bg"   d="M 20 85 A 80 80 0 0 1 180 85"/>
+      <path class="gauge-fill" d="M 20 85 A 80 80 0 0 1 180 85" id="gf-tlwm-drops" stroke="#27ae60"/>
+      <text class="gauge-num"  x="100" y="75" text-anchor="middle" id="gv-tlwm-drops">0</text>
+    </svg>
+    <div class="gauge-label">DESCUENTOS TLWM</div>
+    <div class="gauge-hint">↗ VER LISTA</div>
+  </div>
+  <div class="gauge-card g-rises clickable" id="tlwm-gc-rises" title="Clic para ver alzas">
+    <svg class="gauge-svg" viewBox="0 0 200 95">
+      <path class="gauge-bg"   d="M 20 85 A 80 80 0 0 1 180 85"/>
+      <path class="gauge-fill" d="M 20 85 A 80 80 0 0 1 180 85" id="gf-tlwm-rises" stroke="#e74c3c"/>
+      <text class="gauge-num"  x="100" y="75" text-anchor="middle" id="gv-tlwm-rises">0</text>
+    </svg>
+    <div class="gauge-label">ALZAS TLWM</div>
+    <div class="gauge-hint">↗ VER LISTA</div>
+  </div>
 </div>
 
 <!-- Watchlist -->
@@ -1914,6 +2128,31 @@ if (D.regions.length === 0) {{
     '⚠️  No se detectaron regiones en los nombres de vinos esta corrida';
 }}
 
+// ── TLWM gauges ──────────────────────────────────────────────────────────────
+const T = D.tlwm;
+if (T.is_baseline) document.getElementById('tlwm-baseline-notice').style.display = 'block';
+setTimeout(() => {{
+  setGauge('tlwm-total', T.total,       T.total);
+  setGauge('tlwm-new',   T.new_total,   Math.max(T.new_total, 10));
+  setGauge('tlwm-drops', T.n_drops,     Math.max(T.n_drops, 10));
+  setGauge('tlwm-rises', T.n_increases, Math.max(T.n_increases, 10));
+}}, 300);
+document.getElementById('tlwm-gc-new').addEventListener('click', () => {{
+  if (!T.new_wines_list.length) return;
+  const wines = T.new_wines_list.map(w => ({{...w, cat: w.type || 'TLWM'}}));
+  openModal('🍷 TLWM — Nuevos Vinos', `${{T.new_total}} vino(s) nuevo(s) en The Little Wine Market`, wines, 'new');
+}});
+document.getElementById('tlwm-gc-drops').addEventListener('click', () => {{
+  if (!T.drops_list.length) return;
+  const wines = T.drops_list.map(w => ({{...w, cat: 'TLWM'}}));
+  openModal('📉 TLWM — Descuentos', `${{T.n_drops}} vino(s) con precio más bajo`, wines, 'drops');
+}});
+document.getElementById('tlwm-gc-rises').addEventListener('click', () => {{
+  if (!T.increases_list.length) return;
+  const wines = T.increases_list.map(w => ({{...w, cat: 'TLWM'}}));
+  openModal('📈 TLWM — Alzas', `${{T.n_increases}} vino(s) con precio más alto`, wines, 'rises');
+}});
+
 // ── Watchlist cards ──────────────────────────────────────────────────────────
 const grid = document.getElementById('watchlist-grid');
 if (D.watchlist.length === 0) {{
@@ -1922,6 +2161,17 @@ if (D.watchlist.length === 0) {{
 D.watchlist.forEach((w, idx) => {{
   const card = document.createElement('div');
   card.className = 'wl-card';
+
+  if (w.pending) {{
+    card.innerHTML = `
+      <div class="wl-name">${{w.name}}</div>
+      <div class="wl-site">${{w.site}}</div>
+      <div style="margin-top:12px;color:var(--muted);font-size:0.8rem">
+        ⏳ Actualizando precio…
+      </div>`;
+    grid.appendChild(card);
+    return;
+  }}
 
   const hist     = w.history || [];
   const priceStr = w.price != null
@@ -2007,27 +2257,48 @@ def main() -> None:
     # 1. Costco
     costco_snapshot, costco_changes, costco_history = run_costco(today)
 
-    # 2. Watchlist
-    watchlist_results, watchlist_history = run_watchlist(today)
+    # 2. The Little Wine Market
+    tlwm_snapshot, tlwm_changes, tlwm_history = run_tlwm(today)
 
-    # 3. Dashboard
-    generate_dashboard(today, costco_snapshot, costco_changes,
-                       costco_history, watchlist_results, watchlist_history)
+    # 3. Fast watchlist (requests-based — no browser needed)
+    watchlist_history = load_json(WATCHLIST_HISTORY_FILE)
+    fast_results = watchlist_fetch_group(browser=False)
 
-    # 4. Toast summary
+    # 4. Generate initial dashboard immediately with "⏳ Actualizando…" for Soriana
+    pending = watchlist_pending_placeholders()
+    generate_dashboard(today, costco_snapshot, costco_changes, costco_history,
+                       tlwm_snapshot, tlwm_changes, tlwm_history,
+                       fast_results + pending, watchlist_history)
+    log.info("── Dashboard inicial listo — iniciando Soriana (browser)…")
+
+    # 5. Fetch browser-based items (Soriana / Selenium) and regenerate dashboard
+    browser_results = watchlist_fetch_group(browser=True)
+    all_results = fast_results + browser_results
+    watchlist_history = watchlist_update_history(watchlist_history, all_results, today)
+    prepend_to_file(WATCHLIST_FINDINGS_FILE, watchlist_build_report(all_results, watchlist_history, today))
+    save_json(WATCHLIST_HISTORY_FILE, watchlist_history)
+    generate_dashboard(today, costco_snapshot, costco_changes, costco_history,
+                       tlwm_snapshot, tlwm_changes, tlwm_history,
+                       all_results, watchlist_history)
+    watchlist_results = all_results
+
+    # 6. Toast summary
     parts: list[str] = []
     if costco_changes:
         n_new = sum(len(v) for v in costco_changes.get("new_wines", {}).values())
         n_d   = sum(len(v) for v in costco_changes.get("price_drops", {}).values())
         n_i   = sum(len(v) for v in costco_changes.get("price_increases", {}).values())
         if n_new: parts.append(f"{n_new} nuevo(s) en Costco")
-        if n_d:   parts.append(f"{n_d} descuento(s) 📉")
-        if n_i:   parts.append(f"{n_i} alza(s) 📈")
-    if watchlist_results:
-        nd = sum(1 for r in watchlist_results if r["price"] and
+        if n_d:   parts.append(f"{n_d} descuento(s) Costco 📉")
+        if n_i:   parts.append(f"{n_i} alza(s) Costco 📈")
+    if tlwm_changes:
+        if tlwm_changes["new_wines"]: parts.append(f"{len(tlwm_changes['new_wines'])} nuevo(s) TLWM")
+        if tlwm_changes["drops"]:     parts.append(f"{len(tlwm_changes['drops'])} descuento(s) TLWM 📉")
+    if all_results:
+        nd = sum(1 for r in all_results if r["price"] and
                  watchlist_prev_price(watchlist_history, r["url"]) and
                  r["price"] < watchlist_prev_price(watchlist_history, r["url"]))
-        ni = sum(1 for r in watchlist_results if r["price"] and
+        ni = sum(1 for r in all_results if r["price"] and
                  watchlist_prev_price(watchlist_history, r["url"]) and
                  r["price"] > watchlist_prev_price(watchlist_history, r["url"]))
         if nd: parts.append(f"{nd} baja watchlist 📉")
