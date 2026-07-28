@@ -425,65 +425,45 @@ $n.Dispose()
 #  COSTCO MONITOR
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _costco_extract_price(item_tag) -> tuple[float | None, str]:
-    for sel in [".product-price-amount", ".price", ".product-price", ".js-price",
-                ".priceValue", ".productPrice", "[class*='price'] span",
-                "[class*='Price']", "span.value", ".item-price"]:
-        try:
-            el = item_tag.select_one(sel)
-        except Exception:
-            continue
-        if el:
-            raw = el.get_text(strip=True)
-            val = parse_price(raw)
-            if val:
-                return val, raw
-    for tag in item_tag.find_all(True):
-        text = tag.get_text(strip=True)
-        if re.match(r"^\$[\d,]+\.\d{2}$", text):
-            val = parse_price(text)
-            if val:
-                return val, text
-    return None, ""
-
-
 def costco_scrape_category(cat_name: str, base_url: str) -> list[dict]:
+    """Scrape one Costco category via the REST JSON API (Spartacus/SAP Commerce)."""
     products: list[dict] = []
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    page_num = 0
+    cat_m = re.search(r'/c/([\w\.]+)$', base_url)
+    if not cat_m:
+        log.warning("  Costco: no category code in URL %s", base_url)
+        return products
+    cat_code = cat_m.group(1)
+    api_url  = "https://www.costco.com.mx/rest/v2/mexico/products/search"
+    session  = requests.Session()
+    session.headers.update({**HEADERS, "Accept": "application/json", "Referer": base_url})
+    page = 0
     while True:
-        url = base_url if page_num == 0 else f"{base_url}?page={page_num}"
         try:
-            resp = session.get(url, timeout=30)
+            resp = session.get(api_url, params={
+                "fields": "FULL", "query": "", "pageSize": 100,
+                "currentPage": page, "category": cat_code,
+                "lang": "es_MX", "curr": "MXN",
+            }, timeout=30)
             resp.raise_for_status()
-        except requests.RequestException as exc:
-            log.warning("  Costco fetch failed [%s] p%d: %s", cat_name, page_num + 1, exc)
+            data = resp.json()
+        except Exception as exc:
+            log.warning("  Costco fetch failed [%s] p%d: %s", cat_name, page + 1, exc)
             break
-        soup  = BeautifulSoup(resp.text, "html.parser")
-        items = soup.select("li.product-list-item") or \
-                soup.select("sip-product-list-item") or \
-                soup.select("li[class*='product']")
-        if not items:
-            break
-        for item in items:
-            thumb = item.select_one("a.thumb[title]") or item.select_one("a[title]")
-            if not thumb:
-                continue
-            name = thumb.get("title", "").strip()
+        for p in data.get("products", []):
+            name = p.get("name", "").strip()
             if not name:
                 continue
-            href = thumb.get("href", "")
-            url  = ("https://www.costco.com.mx" + href) if href.startswith("/") else href
-            price, price_raw = _costco_extract_price(item)
+            price_obj = p.get("price") or {}
+            price     = price_obj.get("value")
+            price_raw = price_obj.get("formattedValue", "")
+            href      = p.get("url", "")
+            url       = ("https://www.costco.com.mx" + href) if href.startswith("/") else href
             products.append({"name": name, "price": price, "price_raw": price_raw, "url": url})
-        hrefs = [a.get("href", "") for a in soup.select("a.page-link[href*='page=']")]
-        if not hrefs:
+        pagination  = data.get("pagination", {})
+        total_pages = pagination.get("totalPages", 1)
+        if page + 1 >= total_pages:
             break
-        max_p = max((int(m.group(1)) for h in hrefs if (m := re.search(r"page=(\d+)", h))), default=0)
-        if page_num + 1 > max_p:
-            break
-        page_num += 1
+        page += 1
         time.sleep(PAGE_SLEEP)
     log.info("  %-30s  %d vinos  (%d con precio)",
              cat_name, len(products), sum(1 for p in products if p["price"]))
